@@ -1,5 +1,5 @@
 import streamlit as st
-import pyodbc
+import sqlite3
 import pandas as pd
 import datetime
 
@@ -327,42 +327,8 @@ st.markdown("""
 
 @st.cache_resource
 def init_connection():
-    """
-    Establish a cached connection to SQL Server via pyodbc.
-    Dynamically detects the installed ODBC driver version.
-    Returns the connection object on success, or None on failure.
-    """
     try:
-        available_drivers = pyodbc.drivers()
-        preferred = [
-            "ODBC Driver 18 for SQL Server",
-            "ODBC Driver 17 for SQL Server",
-            "SQL Server Native Client 11.0",
-            "SQL Server",
-        ]
-        driver = None
-        for d in preferred:
-            if d in available_drivers:
-                driver = d
-                break
-        if driver is None:
-            driver = "SQL Server"
-
-        connection_string = (
-            f"DRIVER={{{driver}}};"
-            r"SERVER=.\SQLEXPRESS;"
-            "DATABASE=Project;"
-            "Trusted_Connection=yes;"
-            "Timeout=5;"
-        )
-        if "18" in driver:
-            connection_string += "Encrypt=no;TrustServerCertificate=yes;"
-
-        return pyodbc.connect(connection_string, autocommit=False)
-
-    except pyodbc.Error as e:
-        st.session_state["db_error"] = str(e)
-        return None
+        return sqlite3.connect('bakeshop.db', check_same_thread=False)
     except Exception as e:
         st.session_state["db_error"] = str(e)
         return None
@@ -372,34 +338,17 @@ def init_connection():
 # QUERY & EXECUTION HELPERS
 # ──────────────────────────────────────────────────────────────────────────────
 def run_query(query, params=()):
-    """
-    Execute a SQL query safely.
-    - For SELECT: returns a pandas DataFrame.
-    """
     conn = init_connection()
     if conn is None:
         return pd.DataFrame()
     try:
-        cursor = conn.cursor()
-        cursor.execute(query, params)
-        columns = [desc[0] for desc in cursor.description]
-        rows = cursor.fetchall()
-        return pd.DataFrame.from_records(rows, columns=columns)
+        return pd.read_sql_query(query, conn, params=params)
     except Exception as e:
-        try:
-            conn.rollback()
-        except Exception:
-            pass
         st.error(f"Database error: {e}")
         return pd.DataFrame()
 
 
 def execute_action(query, params=()):
-    """
-    Execute a write query (INSERT / UPDATE / DELETE / EXEC procedure).
-    Returns (True, "Success") on success, or (False, error_string) on failure.
-    This lets the UI display exact SQL trigger RAISERROR messages.
-    """
     conn = init_connection()
     if conn is None:
         return False, "No database connection."
@@ -408,7 +357,7 @@ def execute_action(query, params=()):
         cursor.execute(query, params)
         conn.commit()
         return True, "Success"
-    except pyodbc.Error as e:
+    except sqlite3.Error as e:
         try:
             conn.rollback()
         except Exception:
@@ -422,30 +371,7 @@ def execute_action(query, params=()):
         return False, str(e)
 
 
-def run_query_from_proc(query, params=()):
-    """
-    Execute a stored procedure that returns a result set (e.g. sp_CheckProductFeasibility).
-    Returns a pandas DataFrame with the results.
-    """
-    conn = init_connection()
-    if conn is None:
-        return pd.DataFrame()
-    try:
-        cursor = conn.cursor()
-        cursor.execute(query, params)
-        if cursor.description:
-            columns = [desc[0] for desc in cursor.description]
-            rows = cursor.fetchall()
-            return pd.DataFrame.from_records(rows, columns=columns)
-        else:
-            return pd.DataFrame()
-    except Exception as e:
-        try:
-            conn.rollback()
-        except Exception:
-            pass
-        st.error(f"Database error: {e}")
-        return pd.DataFrame()
+
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -526,7 +452,7 @@ if page == "🧾  Point of Sale":
 
     # ── Fetch lookup data ──
     customers_df = run_query(
-        "SELECT CustomerID, First_Name + ' ' + Last_Name AS Name FROM Customers"
+        "SELECT CustomerID, First_Name || ' ' || Last_Name AS Name FROM Customers"
     )
     products_df = run_query(
         "SELECT ProductID, Product AS Name, Base_Price FROM vw_ActiveProducts"
@@ -593,7 +519,7 @@ if page == "🧾  Point of Sale":
                     line_total = unit_price * quantity
 
                     next_id_df = run_query(
-                        "SELECT ISNULL(MAX(Order_Detail_ID), 0) + 1 AS NextID FROM Order_Details"
+                        "SELECT IFNULL(MAX(Order_Detail_ID), 0) + 1 AS NextID FROM Order_Details"
                     )
                     next_detail_id = int(next_id_df.iloc[0]["NextID"]) if not next_id_df.empty else 1
 
@@ -639,10 +565,14 @@ if page == "🧾  Point of Sale":
 
         if submitted_payment:
             current_date = datetime.datetime.now().strftime('%Y-%m-%d')
-            ok, msg = execute_action(
-                "EXEC sp_ProcessPayment @PaymentID=?, @OrderID=?, @PayDate=?, @AmountPaid=?",
-                (payment_id, selected_order_pay, current_date, amount_paid),
-            )
+            order_df = run_query("SELECT Final_Total FROM Orders WHERE Order_ID=?", (selected_order_pay,))
+            if not order_df.empty and amount_paid >= float(order_df.iloc[0]["Final_Total"]):
+                ok, msg = execute_action(
+                    "INSERT INTO payments (Payment_ID, Order_ID, Payment_Date, Amount_Paid, Payment_Status) VALUES (?, ?, ?, ?, 1)",
+                    (payment_id, selected_order_pay, current_date, amount_paid),
+                )
+            else:
+                ok, msg = False, "Underpayment: Amount paid is less than the order total."
             if ok:
                 st.success(f"✅ Payment #{payment_id} processed for Order #{selected_order_pay}.")
             else:
@@ -653,7 +583,7 @@ if page == "🧾  Point of Sale":
     # ── Table 1: Recent Orders ──
     st.subheader("Recent Orders")
     orders_df = run_query(
-        "SELECT TOP 10 * FROM vw_OrderSummary ORDER BY Order_Date DESC"
+        "SELECT * FROM vw_OrderSummary ORDER BY Order_Date DESC LIMIT 10"
     )
     st.dataframe(orders_df, use_container_width=True, hide_index=True)
 
@@ -760,7 +690,7 @@ elif page == "📦  Supply Chain & Inventory":
                 ok, msg = execute_action(
                     "EXEC sp_ReceiveBatch @BatchID=?, @IngredientID=?, @PO_ID=?, "
                     "@ReceiveDate=?, @ExpiryDate=?, @QtyReceived=?",
-                    (batch_id, ingr_id, batch_po_id, receive_date, expiry_date, qty_received),
+                    (batch_id, ingr_id, batch_po_id, receive_date, expiry_date, qty_received, qty_received),
                 )
                 if ok:
                     st.success(
@@ -832,9 +762,21 @@ elif page == "🧁  Recipes & Manufacturing":
         if submitted_feas:
             if products_df is not None and not products_df.empty and selected_prod_f != "No products loaded":
                 prod_id_f = int(selected_prod_f.split(" — ")[0])
-                result_df = run_query_from_proc(
-                    "EXEC sp_CheckProductFeasibility @ProductID=?, @Quantity=?",
-                    (prod_id_f, feas_qty),
+                result_df = run_query(
+                    """
+                    SELECT 
+                        i.Name AS Ingredient,
+                        r.quantity_required * ? AS RequiredQty,
+                        i.Current_stock AS CurrentStock,
+                        CASE 
+                            WHEN i.Current_stock >= (r.quantity_required * ?) THEN 'Yes'
+                            ELSE 'No'
+                        END AS IsFeasible
+                    FROM Recipes r
+                    JOIN Ingredients i ON r.IngredientID = i.IngredientID
+                    WHERE r.ProductID = ?
+                    """,
+                    (feas_qty, feas_qty, prod_id_f),
                 )
                 if not result_df.empty:
                     st.dataframe(result_df, use_container_width=True, hide_index=True)
@@ -886,7 +828,7 @@ elif page == "🧁  Recipes & Manufacturing":
                 ingr_id_r = int(selected_ingr_r.split(" — ")[0])
 
                 ok, msg = execute_action(
-                    "EXEC sp_AddRecipeIngredient @RecipeID=?, @ProductID=?, @IngredientID=?, @QtyRequired=?",
+                    "REPLACE INTO Recipes (RecipeID, ProductID, IngredientID, quantity_required) VALUES (?, ?, ?, ?)",
                     (recipe_id, prod_id_r, ingr_id_r, qty_required),
                 )
                 if ok:
@@ -926,7 +868,7 @@ elif page == "🚚  Logistics & Delivery":
     # ── Fetch lookup data ──
     orders_for_delivery = run_query("SELECT Order_ID FROM Orders ORDER BY Order_ID DESC")
     riders_df = run_query(
-        "SELECT Rider_ID, First_Name + ' ' + Last_Name AS Name FROM Delivery_Riders"
+        "SELECT Rider_ID, First_Name || ' ' || Last_Name AS Name FROM Delivery_Riders"
     )
     active_deliveries_df = run_query(
         "SELECT Delivery_ID FROM Deliveries WHERE Delivery_Status = 0 ORDER BY Delivery_ID"
@@ -964,7 +906,7 @@ elif page == "🚚  Logistics & Delivery":
             if riders_df is not None and not riders_df.empty and selected_rider != "No riders loaded":
                 rider_id = int(selected_rider.split(" — ")[0])
                 ok, msg = execute_action(
-                    "EXEC sp_AssignDelivery @DeliveryID=?, @OrderID=?, @RiderID=?, @AddressID=1",
+                    "INSERT INTO Deliveries (Delivery_ID, Order_ID, Rider_ID, AddressID, Delivery_Status) VALUES (?, ?, ?, 1, 0)",
                     (delivery_id_input, selected_order_del, rider_id),
                 )
                 if ok:
@@ -998,7 +940,7 @@ elif page == "🚚  Logistics & Delivery":
         if submitted_complete:
             if active_deliveries_df is not None and not active_deliveries_df.empty:
                 ok, msg = execute_action(
-                    "EXEC sp_CompleteDelivery @DeliveryID=?",
+                    "UPDATE Deliveries SET Delivery_Status = 1, Delivery_Time = datetime('now', 'localtime') WHERE Delivery_ID = ?",
                     (selected_del_complete,),
                 )
                 if ok:
@@ -1069,7 +1011,7 @@ elif page == "👨‍🍳  HR & Operations":
         if hire_submitted:
             if first_name.strip() and last_name.strip():
                 ok, msg = execute_action(
-                    "EXEC sp_HireEmployee @EmpID=?, @FirstName=?, @LastName=?, @Phone=?, @Salary=?",
+                    "INSERT INTO Employees (Employee_ID, First_Name, Last_Name, Hire_Date, Phone, Salary) VALUES (?, ?, ?, date('now', 'localtime'), ?, ?)",
                     (emp_id, first_name.strip(), last_name.strip(), phone.strip(), salary),
                 )
                 if ok:
@@ -1109,7 +1051,7 @@ elif page == "👨‍🍳  HR & Operations":
             if equipment_df is not None and not equipment_df.empty and selected_equip != "No equipment loaded":
                 equip_id = int(selected_equip.split(" — ")[0])
                 ok, msg = execute_action(
-                    "EXEC sp_UpdateEquipmentStatus @EquipmentID=?, @NewStatus=?",
+                    "UPDATE Kitchen_Equipment SET Status = ? WHERE Equipment_ID = ?",
                     (equip_id, new_status),
                 )
                 if ok:
